@@ -5,10 +5,13 @@ async inference, poll for results, and play/download the output video.
 """
 
 import json
+import logging
 import os
+import threading
 import uuid
 
 import boto3
+import requests
 from flask import Flask, Response, jsonify, request, send_file, render_template_string
 
 app = Flask(__name__)
@@ -16,19 +19,26 @@ app = Flask(__name__)
 # --- Configuration -----------------------------------------------------------
 
 _session = boto3.Session()
-REGION = os.environ.get("AWS_REGION", _session.region_name or "us-east-1")
+REGION = os.environ.get("AWS_REGION", _session.region_name or "eu-north-1")
 ACCOUNT_ID = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
-BUCKET = f"sadtalker-demo-{ACCOUNT_ID}"
-ENDPOINT = "sadtalker-async"
+BUCKET = os.environ.get("S3_BUCKET", f"sadtalker-demo-{ACCOUNT_ID}")
+INFERENCE_URL = os.environ.get("INFERENCE_URL", "http://sadtalker:8080")
+INFERENCE_TIMEOUT = int(os.environ.get("INFERENCE_TIMEOUT", "900"))
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-RESULTS_DIR = os.path.join(_BASE_DIR, "..", "results")
-CONFIG_FILE = os.path.join(_BASE_DIR, "..", "config.json")
+RESULTS_DIR = os.environ.get("RESULTS_DIR", os.path.join(_BASE_DIR, "results"))
+CONFIG_FILE = os.environ.get("CONFIG_FILE", os.path.join(_BASE_DIR, "config.json"))
 
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
 s3 = boto3.client("s3", region_name=REGION)
-sm_runtime = boto3.client("sagemaker-runtime", region_name=REGION)
+
+# Job state: job_id -> {"status": str, "error": str | None}
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
 
 DEFAULT_CONFIG = {
     "enhancer": "gfpgan",
@@ -55,16 +65,42 @@ def save_config(cfg: dict) -> None:
         json.dump(cfg, f, indent=2)
 
 
-def _upload_payload(job_id: str, payload: str) -> str:
-    """Upload JSON payload to S3 and return its URI for async invocation."""
-    key = f"async-input/{job_id}.json"
-    s3.put_object(Bucket=BUCKET, Key=key, Body=payload, ContentType="application/json")
-    return f"s3://{BUCKET}/{key}"
-
-
 def _get_local_path(job_id: str) -> str:
     """Return local file path for a job's result video."""
     return os.path.join(RESULTS_DIR, f"{job_id}.mp4")
+
+
+def _set_job(job_id: str, status: str, error: str | None = None) -> None:
+    with _jobs_lock:
+        _jobs[job_id] = {"status": status, "error": error}
+
+
+def _run_inference(job_id: str, payload: dict) -> None:
+    """Call the inference container synchronously; update job state."""
+    _set_job(job_id, "Processing (GPU inference)...")
+    try:
+        resp = requests.post(
+            f"{INFERENCE_URL}/invocations",
+            json=payload,
+            timeout=INFERENCE_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            _set_job(job_id, "error", f"Inference returned {resp.status_code}: {resp.text[:500]}")
+            return
+    except requests.RequestException as e:
+        _set_job(job_id, "error", f"Inference request failed: {e}")
+        return
+
+    # Download result from S3 to local results dir so the UI can serve it
+    out_key = f"output/{job_id}/result.mp4"
+    local_path = _get_local_path(job_id)
+    try:
+        s3.download_file(BUCKET, out_key, local_path)
+    except Exception as e:
+        _set_job(job_id, "error", f"Failed to fetch result from S3: {e}")
+        return
+
+    _set_job(job_id, "done")
 
 
 # --- HTML Template -----------------------------------------------------------
@@ -331,7 +367,7 @@ def invoke() -> Response:
     except Exception as e:
         return jsonify({"error": f"Upload failed: {e}"}), 500
 
-    payload = json.dumps({
+    payload = {
         "image_s3_uri": f"s3://{BUCKET}/{img_key}",
         "audio_s3_uri": f"s3://{BUCKET}/{aud_key}",
         "output_s3_uri": f"s3://{BUCKET}/{out_key}",
@@ -340,36 +376,25 @@ def invoke() -> Response:
         "preprocess": cfg.get("preprocess", "crop"),
         "expression_scale": cfg.get("expression_scale", 1.0),
         "pose_style": cfg.get("pose_style", 0),
-    })
+    }
 
-    try:
-        resp = sm_runtime.invoke_endpoint_async(
-            EndpointName=ENDPOINT,
-            ContentType="application/json",
-            InputLocation=_upload_payload(job_id, payload),
-        )
-    except Exception as e:
-        return jsonify({"error": f"Failed to invoke endpoint: {e}"}), 500
+    _set_job(job_id, "Uploading to inference...")
+    threading.Thread(target=_run_inference, args=(job_id, payload), daemon=True).start()
 
-    return jsonify({"job_id": job_id, "inference_id": resp.get("InferenceId")})
+    return jsonify({"job_id": job_id})
 
 
 @app.route("/api/status/<job_id>")
 def status(job_id: str) -> Response:
-    """Poll for job completion by checking if output exists in S3."""
+    """Poll for job completion using in-memory job state."""
     if not _is_valid_job_id(job_id):
         return jsonify({"error": "Invalid job ID"}), 400
 
-    out_key = f"output/{job_id}/result.mp4"
-    try:
-        s3.head_object(Bucket=BUCKET, Key=out_key)
-        # Auto-download to local results folder
-        local_path = _get_local_path(job_id)
-        if not os.path.exists(local_path):
-            s3.download_file(BUCKET, out_key, local_path)
-        return jsonify({"status": "done"})
-    except s3.exceptions.ClientError:
-        return jsonify({"status": "Processing (waiting for GPU inference)..."})
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"status": "error", "error": "Unknown job"}), 404
+    return jsonify(job)
 
 
 @app.route("/api/video/<job_id>")
@@ -416,8 +441,10 @@ def _is_valid_job_id(job_id: str) -> bool:
 # --- Entry point -------------------------------------------------------------
 
 if __name__ == "__main__":
-    print(f"\n🎙️  SadTalker Demo UI")
-    print(f"   Open http://localhost:5000 in your browser")
-    print(f"   Results saved to: {os.path.abspath(RESULTS_DIR)}")
-    print(f"   Bucket: {BUCKET} ({REGION})\n")
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "1") == "1"
+    logger.info("SadTalker Demo UI on http://%s:%d", host, port)
+    logger.info("Inference URL: %s", INFERENCE_URL)
+    logger.info("Bucket: %s (%s)", BUCKET, REGION)
+    app.run(host=host, port=port, debug=debug)
