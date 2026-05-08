@@ -46,6 +46,7 @@ DEFAULT_CONFIG = {
     "preprocess": "crop",
     "expression_scale": 1.0,
     "pose_style": 0,
+    "lip_sync": True,
 }
 
 
@@ -85,7 +86,17 @@ def _run_inference(job_id: str, payload: dict) -> None:
             timeout=INFERENCE_TIMEOUT,
         )
         if resp.status_code != 200:
-            _set_job(job_id, "error", f"Inference returned {resp.status_code}: {resp.text[:500]}")
+            try:
+                body = resp.json()
+                parts = [f"Inference returned {resp.status_code}: {body.get('error', '')}"]
+                if body.get("stderr"):
+                    parts.append("--- stderr ---\n" + body["stderr"])
+                if body.get("stdout"):
+                    parts.append("--- stdout ---\n" + body["stdout"])
+                msg = "\n\n".join(parts)
+            except ValueError:
+                msg = f"Inference returned {resp.status_code}: {resp.text}"
+            _set_job(job_id, "error", msg)
             return
     except requests.RequestException as e:
         _set_job(job_id, "error", f"Inference request failed: {e}")
@@ -122,7 +133,9 @@ button { background: #ff9900; border: none; padding: 12px 24px; color: #000;
          font-weight: bold; border-radius: 4px; cursor: pointer; font-size: 16px; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 .btn-secondary { background: #232f3e; color: #fff; padding: 8px 16px; font-size: 14px; }
-#status { margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: none; }
+#status { margin: 20px 0; padding: 15px; background: #f0f0f0; border-radius: 4px; display: none;
+          white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, monospace;
+          font-size: 12px; max-height: 400px; overflow: auto; }
 video { width: 100%; max-width: 640px; margin-top: 20px; border-radius: 8px; }
 .spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #ccc;
            border-top-color: #ff9900; border-radius: 50%; animation: spin 1s linear infinite; }
@@ -184,6 +197,15 @@ video { width: 100%; max-width: 640px; margin-top: 20px; border-radius: 8px; }
     <span class="desc">Selects a pre-defined head pose trajectory. 0 = default.
       Each number produces a different combination of head tilts and turns.</span>
   </div>
+  <div class="setting-row">
+    <label for="lip_sync">Wav2Lip Refinement:</label>
+    <select id="lip_sync">
+      <option value="true">On (sharper lip sync, +30-60s)</option>
+      <option value="false">Off (SadTalker only, faster)</option>
+    </select>
+    <span class="desc">Chains Wav2Lip after SadTalker to replace the mouth region with phoneme-accurate lip movement.
+      Big quality win on real faces; slight extra time per request.</span>
+  </div>
   <button class="btn-secondary" onclick="saveSettings()">Save Settings</button>
   <button class="btn-secondary" onclick="resetSettings()" style="background:#666">Reset Defaults</button>
   <span id="save-confirm" style="color:green; margin-left:10px; display:none">&#10003; Saved</span>
@@ -207,6 +229,7 @@ fetch('/api/config').then(r => r.json()).then(cfg => {
   document.getElementById('expression_scale').value = cfg.expression_scale || 1.0;
   document.getElementById('expression_val').textContent = cfg.expression_scale || 1.0;
   document.getElementById('pose_style').value = cfg.pose_style || 0;
+  document.getElementById('lip_sync').value = String(cfg.lip_sync !== false);
 });
 
 document.getElementById('expression_scale').oninput = function() {
@@ -220,6 +243,7 @@ function getSettings() {
     preprocess: document.getElementById('preprocess').value,
     expression_scale: parseFloat(document.getElementById('expression_scale').value),
     pose_style: parseInt(document.getElementById('pose_style').value, 10),
+    lip_sync: document.getElementById('lip_sync').value === 'true',
   };
 }
 
@@ -243,6 +267,7 @@ function resetSettings() {
     document.getElementById('expression_scale').value = cfg.expression_scale;
     document.getElementById('expression_val').textContent = cfg.expression_scale;
     document.getElementById('pose_style').value = cfg.pose_style;
+    document.getElementById('lip_sync').value = String(cfg.lip_sync !== false);
     const c = document.getElementById('save-confirm');
     c.textContent = '\\u2713 Reset';
     c.style.display = 'inline';
@@ -376,6 +401,7 @@ def invoke() -> Response:
         "preprocess": cfg.get("preprocess", "crop"),
         "expression_scale": cfg.get("expression_scale", 1.0),
         "pose_style": cfg.get("pose_style", 0),
+        "lip_sync": cfg.get("lip_sync", True),
     }
 
     _set_job(job_id, "Uploading to inference...")

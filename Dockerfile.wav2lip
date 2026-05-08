@@ -1,0 +1,46 @@
+# Base is the pre-wav2lip SadTalker image. Pin to the :base tag (or pass an
+# @sha256:... digest) so rebuilds don't accidentally rebase on top of our own
+# previous output (which is published to :latest).
+#
+# Build with: docker build -f Dockerfile.wav2lip \
+#   --build-arg AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID \
+#   --build-arg AWS_REGION=eu-north-1 \
+#   -t sadtalker-inference:latest .
+ARG AWS_ACCOUNT_ID
+ARG AWS_REGION=eu-north-1
+ARG BASE_TAG=base
+ARG ECR_IMAGE=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/sadtalker-inference:${BASE_TAG}
+FROM ${ECR_IMAGE}
+
+# Wav2Lip refinement stage: chains after SadTalker to replace the mouth region
+# with phoneme-accurate lip movement.
+
+# opencv-python + batch_face (RetinaFace detector used by the justinjohn0306 fork).
+# numpy/torch already present in the base image.
+RUN pip install --no-cache-dir opencv-python==4.8.0.76 batch-face==1.4.0
+
+# Clone the Python 3.10-compatible fork of Wav2Lip. Idempotent so we can
+# rebuild on top of a previous wav2lip image without conflict.
+RUN rm -rf /opt/wav2lip && git clone https://github.com/justinjohn0306/Wav2Lip.git /opt/wav2lip
+WORKDIR /opt/wav2lip
+
+# Download Wav2Lip GAN checkpoint (~400 MB) and s3fd face detector (~85 MB).
+RUN mkdir -p checkpoints face_detection/detection/sfd && \
+    (test -f checkpoints/wav2lip_gan.pth || wget -q -O checkpoints/wav2lip_gan.pth \
+        https://huggingface.co/numz/wav2lip_studio/resolve/main/Wav2lip/wav2lip_gan.pth) && \
+    (test -f face_detection/detection/sfd/s3fd.pth || wget -q -O face_detection/detection/sfd/s3fd.pth \
+        https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth)
+
+# Copy updated serve.py that chains SadTalker -> Wav2Lip
+COPY serve.py /opt/sadtalker/serve.py
+
+# Pre-download the RetinaFace weights that batch_face lazy-loads to the torch hub
+# cache, then copy them to the hard-coded path the justinjohn0306 fork expects
+# (checkpoints/mobilenet.pth, resolved relative to /opt/wav2lip).
+RUN python -c "from batch_face import RetinaFace; RetinaFace(gpu_id=-1)" && \
+    cp /root/.cache/torch/hub/checkpoints/mobilenet0.25_Final.pth \
+       /opt/wav2lip/checkpoints/mobilenet.pth
+
+WORKDIR /opt/sadtalker
+EXPOSE 8080
+ENTRYPOINT ["python", "serve.py"]
